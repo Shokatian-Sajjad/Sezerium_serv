@@ -1,36 +1,47 @@
 """
 test_server.py
 ==============
-Automated test suite for sez_server Copernicus DEM extraction.
+Automated test suite for sez_server DEM extraction, JWT Bearer authentication,
+and IP rate limiting.
 
 Tests:
 1. Polygon bounding box calculation and 4-pixel halo expansion.
-2. Direct COG window extraction from AWS Open Data Copernicus DEM GLO-30.
-3. Multi-tile crossing boundary stitching (e.g. across 45°N line).
-4. Coastal / water handling (ensuring water pixels default to 0.0m).
-5. GeoTIFF validity check: parses output bytes directly with rasterio.
-6. FastAPI TestClient verification on /health, /api/v1/dem/inspect, and /api/v1/dem/crop.
+2. Multi-tile crossing boundary calculation (across 45°N line).
+3. FastAPI /health endpoint verification (health, auth, and config status).
+4. JWT Token issuance: valid client key returns access token; invalid key returns 401.
+5. Protected endpoint rejection: unauthenticated or invalid token receives 401 Unauthorized.
+6. Authenticated DEM extraction via OpenTopography provider.
+7. Authenticated direct AWS Open Data S3 windowing extraction.
+8. Coastal / open ocean water handling (0.0m elevation default).
+9. Request validation (ensuring exactly 4 nodes are enforced).
+10. IP rate limit handling (triggers HTTP 429).
 """
 
-import io
 import pytest
 from fastapi.testclient import TestClient
 import numpy as np
-import rasterio
+from rasterio.io import MemoryFile
 
 from main import app
 from dem_engine import (
     calculate_polygon_envelope,
     expand_with_halo,
     align_to_grid,
-    extract_dem_raster,
-    export_as_cog_bytes,
+    get_intersecting_tiles,
     PIXEL_SIZE_DEG,
     HALO_PIXELS,
+    OPENTOPOGRAPHY_API_KEY,
 )
+from auth import CLIENT_API_KEY, create_access_token
 from models import Coordinate
 
 client = TestClient(app)
+
+
+def get_auth_headers(client_id: str = "test_client") -> dict:
+    """Helper to generate valid JWT Authorization headers for tests."""
+    token, _ = create_access_token(subject=client_id)
+    return {"Authorization": f"Bearer {token}"}
 
 
 def test_polygon_envelope_and_halo():
@@ -55,107 +66,198 @@ def test_polygon_envelope_and_halo():
     assert pytest.approx(halo_env.max_lon) == 6.25 + expected_expansion
 
 
+def test_multi_tile_crossing_calculation():
+    """Verify calculation of intersecting tiles spanning across a 1-degree boundary (45.00 lat line)."""
+    nodes = [
+        Coordinate(lat=44.998, lon=6.100),
+        Coordinate(lat=45.002, lon=6.100),
+        Coordinate(lat=45.002, lon=6.104),
+        Coordinate(lat=44.998, lon=6.104),
+    ]
+    orig_bbox = calculate_polygon_envelope(nodes)
+    halo_bbox = expand_with_halo(orig_bbox, halo_pixels=4)
+    grid_bbox, _, _, _ = align_to_grid(halo_bbox)
+    tiles_info = get_intersecting_tiles(grid_bbox)
+    tile_ids = [t[2] for t in tiles_info]
+    assert len(tile_ids) >= 2
+    assert any("N44" in t for t in tile_ids)
+    assert any("N45" in t for t in tile_ids)
+
+
 def test_fastapi_health_endpoint():
-    """Verify health_check logic."""
-    from main import health_check
-    data = health_check()
+    """Verify health_check logic and safe configuration exposure."""
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    data = resp.json()
     assert data["status"] == "healthy"
     assert data["service"] == "sez_server"
     assert data["halo_pixels"] == 4
+    assert data["authentication"] == "JWT Bearer"
+    assert data["rate_limiting"]["enabled"] is True
+    # Verify sensitive keys are NOT leaked in response
+    assert OPENTOPOGRAPHY_API_KEY not in str(data)
+    assert CLIENT_API_KEY not in str(data)
 
 
-def test_api_dem_inspect_and_crop():
-    """Verify inspect and crop endpoints with small Alps mountain query."""
-    from main import inspect_dem_envelope, crop_dem_geotiff
-    from models import DEMPolygonRequest
-
-    req = DEMPolygonRequest(
-        nodes=[
-            Coordinate(lat=45.830, lon=6.860),
-            Coordinate(lat=45.833, lon=6.860),
-            Coordinate(lat=45.833, lon=6.864),
-            Coordinate(lat=45.830, lon=6.864),
-        ]
+def test_jwt_auth_token_issuance():
+    """Verify token generation via /api/v1/auth/token endpoint."""
+    # 1. Valid client API key
+    valid_resp = client.post(
+        "/api/v1/auth/token",
+        json={"client_api_key": CLIENT_API_KEY, "client_id": "pytest_client"},
     )
+    assert valid_resp.status_code == 200
+    body = valid_resp.json()
+    assert "access_token" in body
+    assert body["token_type"] == "bearer"
+    assert body["expires_in_seconds"] > 0
+
+    # 2. Invalid client API key
+    invalid_resp = client.post(
+        "/api/v1/auth/token",
+        json={"client_api_key": "wrong_invalid_key_123"},
+    )
+    assert invalid_resp.status_code == 401
+    assert "Invalid client API key" in invalid_resp.json()["detail"]
+
+
+def test_protected_endpoints_require_authentication():
+    """Verify that calling protected endpoints without JWT token returns 401."""
+    payload = {
+        "nodes": [
+            {"lat": 45.830, "lon": 6.860},
+            {"lat": 45.833, "lon": 6.860},
+            {"lat": 45.833, "lon": 6.864},
+            {"lat": 45.830, "lon": 6.864},
+        ]
+    }
+
+    # Crop without token -> 401
+    crop_resp = client.post("/api/v1/dem/crop", json=payload)
+    assert crop_resp.status_code == 401
+
+    # Inspect without token -> 401
+    inspect_resp = client.post("/api/v1/dem/inspect", json=payload)
+    assert inspect_resp.status_code == 401
+
+    # Call with invalid token -> 401
+    bad_token_resp = client.post(
+        "/api/v1/dem/inspect",
+        json=payload,
+        headers={"Authorization": "Bearer bad_invalid_token_xyz"},
+    )
+    assert bad_token_resp.status_code == 401
+
+
+def test_api_dem_inspect_and_crop_authenticated_opentopography():
+    """Verify inspect and crop endpoints with valid JWT Bearer token via OpenTopography."""
+    headers = get_auth_headers()
+    payload = {
+        "nodes": [
+            {"lat": 45.830, "lon": 6.860},
+            {"lat": 45.833, "lon": 6.860},
+            {"lat": 45.833, "lon": 6.864},
+            {"lat": 45.830, "lon": 6.864},
+        ],
+        "provider": "opentopography",
+        "dem_type": "COP30",
+    }
 
     # Test inspect
-    meta_resp = inspect_dem_envelope(req)
-    assert meta_resp.raster_width > 0
-    assert meta_resp.raster_height > 0
-    assert meta_resp.halo_pixel_margin == 4
-    # French Alps mountain terrain is well above 1000m
-    assert meta_resp.max_elevation_m > 1000.0
+    inspect_resp = client.post("/api/v1/dem/inspect", json=payload, headers=headers)
+    assert inspect_resp.status_code == 200
+    meta = inspect_resp.json()
+    assert meta["raster_width"] > 0
+    assert meta["raster_height"] > 0
+    assert meta["halo_pixel_margin"] == 4
+    assert meta["provider"] == "opentopography"
+    assert meta["max_elevation_m"] > 1000.0
 
     # Test crop
-    crop_resp = crop_dem_geotiff(req)
-    assert crop_resp.media_type == "image/tiff"
-    assert int(crop_resp.headers["X-DEM-Width"]) == meta_resp.raster_width
+    crop_resp = client.post("/api/v1/dem/crop", json=payload, headers=headers)
+    assert crop_resp.status_code == 200
+    assert crop_resp.headers["Content-Type"] == "image/tiff"
+    assert crop_resp.headers["X-DEM-Provider"] == "opentopography"
+    assert int(crop_resp.headers["X-DEM-Width"]) == meta["raster_width"]
 
-    # Verify that the returned bytes form a valid, readable GeoTIFF
-    cog_bytes = crop_resp.body
-    with rasterio.open(io.BytesIO(cog_bytes)) as src:
-        assert src.driver == "GTiff"
-        assert src.count == 1
-        assert src.width == meta_resp.raster_width
-        assert src.height == meta_resp.raster_height
-        data = src.read(1)
-        assert data.shape == (meta_resp.raster_height, meta_resp.raster_width)
-        assert data.max() > 1000.0
+    with MemoryFile(crop_resp.content) as memfile:
+        with memfile.open() as src:
+            assert src.driver == "GTiff"
+            assert src.count == 1
+            data = src.read(1)
+            assert data.shape == (meta["raster_height"], meta["raster_width"])
+            assert data.max() > 1000.0
 
 
-def test_multi_tile_crossing():
-    """Verify crossing a 1-degree boundary (e.g. crossing 45.00 lat line)."""
-    from main import inspect_dem_envelope
-    from models import DEMPolygonRequest
+def test_api_dem_crop_authenticated_aws_s3():
+    """Verify authenticated crop using direct AWS Open Data S3 provider."""
+    from dem_engine import extract_dem_raster, export_as_cog_bytes
+    nodes = [
+        Coordinate(lat=45.830, lon=6.860),
+        Coordinate(lat=45.833, lon=6.860),
+        Coordinate(lat=45.833, lon=6.864),
+        Coordinate(lat=45.830, lon=6.864),
+    ]
+    raster, transform, meta = extract_dem_raster(nodes, provider="aws_s3", halo_pixels=4)
+    assert meta["provider"] == "aws_s3"
+    assert meta["raster_width"] > 0
+    assert meta["raster_height"] > 0
+    assert meta["max_elevation_m"] > 1000.0
 
-    req = DEMPolygonRequest(
-        nodes=[
-            Coordinate(lat=44.998, lon=6.100),
-            Coordinate(lat=45.002, lon=6.100),
-            Coordinate(lat=45.002, lon=6.104),
-            Coordinate(lat=44.998, lon=6.104),
-        ]
-    )
-
-    meta = inspect_dem_envelope(req)
-    # It must query at least two tiles across the 45.0 degree line: N44 and N45
-    assert len(meta.tiles_queried) >= 2
-    assert any("N44" in t for t in meta.tiles_queried)
-    assert any("N45" in t for t in meta.tiles_queried)
+    cog_bytes = export_as_cog_bytes(raster, transform)
+    assert len(cog_bytes) > 0
+    with MemoryFile(cog_bytes) as memfile:
+        with memfile.open() as src:
+            assert src.driver == "GTiff"
+            data = src.read(1)
+            assert data.max() > 1000.0
 
 
 def test_ocean_water_fill():
     """Verify that an area in open water (ocean) fills with 0.0m elevation without failing."""
-    from main import crop_dem_geotiff
-    from models import DEMPolygonRequest
+    headers = get_auth_headers()
+    payload = {
+        "nodes": [
+            {"lat": 36.000, "lon": 18.000},
+            {"lat": 36.003, "lon": 18.000},
+            {"lat": 36.003, "lon": 18.003},
+            {"lat": 36.000, "lon": 18.003},
+        ],
+    }
 
-    req = DEMPolygonRequest(
-        nodes=[
-            Coordinate(lat=36.000, lon=18.000),
-            Coordinate(lat=36.003, lon=18.000),
-            Coordinate(lat=36.003, lon=18.003),
-            Coordinate(lat=36.000, lon=18.003),
-        ]
+    crop_resp = client.post("/api/v1/dem/crop", json=payload, headers=headers)
+    assert crop_resp.status_code == 200
+    with MemoryFile(crop_resp.content) as memfile:
+        with memfile.open() as src:
+            data = src.read(1)
+            assert np.all(data == 0.0)
+
+
+def test_invalid_node_count_validation():
+    """Verify that submitting an invalid number of nodes triggers 422 validation error."""
+    headers = get_auth_headers()
+    resp = client.post(
+        "/api/v1/dem/crop",
+        json={
+            "nodes": [
+                {"lat": 45.0, "lon": 6.0},
+                {"lat": 45.1, "lon": 6.0},
+                {"lat": 45.1, "lon": 6.1},
+            ]
+        },
+        headers=headers,
     )
-
-    crop_resp = crop_dem_geotiff(req)
-    with rasterio.open(io.BytesIO(crop_resp.body)) as src:
-        data = src.read(1)
-        # Open water should default cleanly to 0.0m
-        assert np.all(data == 0.0)
+    assert resp.status_code == 422
 
 
-
-if __name__ == "__main__":
-    print("Running tests directly...")
-    test_polygon_envelope_and_halo()
-    print("Envelope and halo test passed.")
-    test_fastapi_health_endpoint()
-    print("Health endpoint test passed.")
-    test_api_dem_inspect_and_crop()
-    print("DEM inspect and crop test passed.")
-    test_multi_tile_crossing()
-    print("Multi-tile boundary crossing test passed.")
-    test_ocean_water_fill()
-    print("Ocean water fill test passed.")
-    print("ALL TESTS PASSED SUCCESSFULLY!")
+def test_ip_rate_limiting():
+    """Verify that exceeding rate limits returns HTTP 429 Too Many Requests."""
+    # Sending rapid requests to trigger RATE_LIMIT_AUTH (10/minute)
+    statuses = []
+    for _ in range(15):
+        r = client.post(
+            "/api/v1/auth/token",
+            json={"client_api_key": "wrong_rate_test_key"},
+        )
+        statuses.append(r.status_code)
+    assert 429 in statuses

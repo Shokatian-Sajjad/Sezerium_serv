@@ -3,7 +3,7 @@
 ## 1. Project Overview
 - **Project Name:** `sez_server`
 - **Working Directory:** `C:\Users\sajjad\Desktop\sez_server`
-- **Purpose:** High-performance geospatial elevation service that streams Cloud Optimized GeoTIFFs (COGs) of requested geographic polygons using on-the-fly spatial windowing from the AWS Open Data Copernicus DEM GLO-30 dataset.
+- **Purpose:** High-performance geospatial elevation service that streams Cloud Optimized GeoTIFFs (COGs) of requested geographic polygons using on-the-fly spatial windowing from the **OpenTopography Global DEM API** and direct **AWS Open Data Copernicus DEM GLO-30** dataset.
 
 ---
 
@@ -13,14 +13,25 @@
 - **NumPy Specification:** NumPy 2.x (`numpy==2.5.2` installed)
 - **Geospatial Engine:** Rasterio (`rasterio==1.5.1`) with GDAL COG reading and writing
 - **Web Framework:** FastAPI (`0.141.1`) with Uvicorn (`0.52.4`)
+- **Environment Management:** `python-dotenv==1.2.3`
+- **HTTP Client:** `httpx==0.28.1`
 - **Testing:** Pytest (`pytest==9.1.1`)
 
 ---
 
 ## 3. Project Architecture & Algorithm Design
 
-### A. Targeted Spatial Windowing (Minimal Data Transfer)
-Instead of downloading complete 1° × 1° DEM tiles (~70MB-100MB each), the server uses GDAL's virtual filesystem (`/vsicurl/`) and HTTP Range Requests (`rasterio.windows.from_bounds()`). Only the byte ranges of the internal COG blocks intersecting the target area are fetched over the network.
+### A. Dual Provider Architecture
+1. **OpenTopography Global DEM API (`provider: "opentopography"`)**:
+   - Queries OpenTopography Global Datasets API with authorized API key (`OPENTOPOGRAPHY_API_KEY` from `.env`).
+   - Supports multiple global datasets: `COP30` (default), `COP90`, `SRTMGL1`, `AW3D30`, `NASADEM`.
+   - Bounding boxes are queried with halo margin and returned as in-memory GeoTIFFs.
+   - Handles ocean/water bodies returning HTTP 204 No Content by populating `0.0m` elevation arrays.
+2. **Direct AWS S3 Streaming (`provider: "aws_s3"`)**:
+   - Reads directly from `s3://copernicus-dem-30m` using GDAL's virtual filesystem (`/vsicurl/`) and HTTP Range Requests (`rasterio.windows.from_bounds()`).
+   - Slices and mosaics 1° × 1° tiles seamlessly across degree boundaries.
+3. **Automatic Fallback**:
+   - If OpenTopography is the default provider and encounters a quota or network error while requesting `COP30`, it automatically falls back to direct AWS S3 streaming.
 
 ### B. 4-Pixel Halo Expansion (Real Terrain)
 To facilitate edge-distortion-free client-side reprojection, warping, and upscaling:
@@ -32,12 +43,12 @@ To facilitate edge-distortion-free client-side reprojection, warping, and upscal
 5. Clients can perform convolution/spline warping right up to the edge and optionally crop off the 4-pixel perimeter.
 
 ### C. Multi-Tile Spanning & Seamless Mosaicing
-If the requested polygon crosses integer degree lines (e.g. crossing latitude $45.0^\circ$ or longitude $6.0^\circ$), the server:
+If the requested polygon crosses integer degree lines (e.g. crossing latitude $45.0^\circ$ or longitude $6.0^\circ$):
 1. Calculates all intersecting 1° × 1° tiles (e.g., `N44_E006`, `N45_E006`).
 2. Slices each sub-window and mosaics them directly into a unified Float32 canvas.
 3. Automatically sets non-existent tiles (e.g., open sea / ocean areas not present in the Copernicus DEM) to `0.0` meters elevation.
 
-### D. Zero-Delay Ocean Pre-flight Cache
+### D. Zero-Delay Ocean Pre-flight Cache (AWS Provider)
 Non-existent ocean tiles return HTTP 404. To prevent GDAL retry loops on ocean tiles, a fast pre-flight check (`check_tile_exists_on_s3`) probes the tile via HTTP HEAD and caches the result with an LRU cache.
 
 ### E. Cloud Optimized GeoTIFF (COG) Output
@@ -45,31 +56,28 @@ The resulting array is encoded in-memory as a tiled, single-band GeoTIFF with **
 
 ---
 
-## 4. Directory Structure
+## 4. Secret Management & Public Repository Security
+- **Strict `.gitignore` Policy:** `.env`, `.env.*`, `*.env`, `*.local` are explicitly ignored by Git.
+- **Template Provided:** `.env.example` is committed to the repository with placeholder values (`OPENTOPOGRAPHY_API_KEY=your_opentopography_api_key_here`).
+- **Safe API Health Exposure:** The `/health` endpoint exposes a boolean status (`opentopography_configured: true`) without leaking the sensitive API key.
+
+---
+
+## 5. Directory Structure
 ```
 C:\Users\sajjad\Desktop\sez_server\
+├── .env                    # Local secrets (API Key) - NEVER COMMITTED
+├── .env.example            # Public environment variable template
+├── .gitignore              # Ignores .env, .venv, cache, and test rasters
 ├── .venv\                  # Python 3.13 Virtual Environment
 ├── D.md                    # Project description and architectural details (this file)
 ├── CLIENT_GUIDE.md         # Guide for connecting clients (Python, JS, cURL)
 ├── requirements.txt        # Pinned dependencies
 ├── models.py               # Pydantic models (Coordinate, DEMPolygonRequest, etc.)
-├── dem_engine.py           # Core Copernicus DEM windowing and mosaicing engine
+├── dem_engine.py           # Core DEM windowing, OpenTopography & S3 engine
 ├── main.py                 # FastAPI server application
-└── test_server.py          # Pytest test suite
+└── test_server.py          # Pytest automated test suite
 ```
-
----
-
-## 5. Copernicus DEM GLO-30 Specifications
-- **Data Source:** AWS Open Data Registry S3 bucket `s3://copernicus-dem-30m`
-- **HTTP Base URL:** `https://copernicus-dem-30m.s3.amazonaws.com`
-- **Tile Folder & File Pattern:**
-  `Copernicus_DSM_COG_10_{N|S}{lat:02d}_00_{E|W}{lon:03d}_00_DEM/Copernicus_DSM_COG_10_{N|S}{lat:02d}_00_{E|W}{lon:03d}_00_DEM.tif`
-- **Pixel Spacing:** $1/3600^\circ \approx 0.0002777777777778^\circ$ ($\approx 30.9\,\text{m}$ at the equator).
-- **Tile Dimensions:** $3600 \times 3600$ pixels per $1^\circ \times 1^\circ$ tile.
-- **Coordinate Reference System:** WGS 84 (`EPSG:4326`).
-- **Data Type:** 32-bit Floating Point (`Float32`), elevations in meters relative to EGM2008 geoid.
-- **Ocean / Sea Policy:** Open water bodies do not have files in Copernicus DEM. When a tile is absent (HTTP 404), the server assigns `0.0` meters elevation to the affected grid cells.
 
 ---
 
@@ -82,14 +90,16 @@ Returns operational status and capabilities.
 {
   "status": "healthy",
   "service": "sez_server",
-  "dem_dataset": "Copernicus DEM GLO-30 (30m)",
+  "active_provider": "opentopography",
+  "default_dem_type": "COP30",
+  "opentopography_configured": true,
   "halo_pixels": 4,
   "supported_response_formats": ["image/tiff (COG)", "application/json"]
 }
 ```
 
 ### 2. `POST /api/v1/dem/inspect`
-Inspects the polygon and halo bounding box, list of queried tiles, raster dimensions, and elevation range without returning raster data.
+Inspects the polygon and halo bounding box, provider, list of queried tiles, raster dimensions, and elevation range without returning raster data.
 - **Request Format:** JSON
 ```json
 {
@@ -98,51 +108,29 @@ Inspects the polygon and halo bounding box, list of queried tiles, raster dimens
     {"lat": 45.833, "lon": 6.860},
     {"lat": 45.833, "lon": 6.864},
     {"lat": 45.830, "lon": 6.864}
-  ]
-}
-```
-- **Response Format:** JSON (`DEMMetadataResponse`)
-```json
-{
-  "requested_envelope": {
-    "min_lon": 6.86,
-    "min_lat": 45.83,
-    "max_lon": 6.864,
-    "max_lat": 45.833
-  },
-  "halo_envelope": {
-    "min_lon": 6.858888888888889,
-    "min_lat": 45.82888888888889,
-    "max_lon": 6.865277777777778,
-    "max_lat": 45.83416666666667
-  },
-  "halo_pixel_margin": 4,
-  "raster_width": 23,
-  "raster_height": 19,
-  "min_elevation_m": 4212.95,
-  "max_elevation_m": 4810.72,
-  "tiles_queried": ["Copernicus_DSM_COG_10_N45_00_E006_00_DEM"],
-  "crs": "EPSG:4326",
-  "resolution_deg": 0.0002777777777777778
+  ],
+  "dem_type": "COP30",
+  "provider": "opentopography"
 }
 ```
 
 ### 3. `POST /api/v1/dem/crop`
 Performs spatial windowing, adds the 4-pixel halo, and streams back the Cloud Optimized GeoTIFF file.
-- **Request Format:** JSON with 4 nodes (same as inspect).
 - **Response Media Type:** `image/tiff`
 - **Response Headers:**
   - `Content-Disposition`: `inline; filename="dem_halo_crop.tif"`
-  - `X-DEM-Width`: Raster width in pixels (including 4-pixel margins on both sides).
-  - `X-DEM-Height`: Raster height in pixels (including 4-pixel margins on both sides).
+  - `X-DEM-Provider`: `opentopography` (or `aws_s3`)
+  - `X-DEM-Type`: `COP30`
+  - `X-DEM-Width`: Raster width in pixels (including 4-pixel margins).
+  - `X-DEM-Height`: Raster height in pixels (including 4-pixel margins).
   - `X-DEM-Min-Elevation`: Minimum elevation in meters.
   - `X-DEM-Max-Elevation`: Maximum elevation in meters.
   - `X-DEM-Halo-Pixels`: Number of halo pixels added (`4`).
-  - `X-DEM-Tiles-Queried`: Comma-separated list of 1° tiles queried.
+  - `X-DEM-Tiles-Queried`: Queried dataset or tiles.
 
 ---
 
-## 7. Running, Testing & Verification
+## 7. Running & Testing
 
 ```powershell
 # Run the automated test suite
@@ -151,8 +139,3 @@ Performs spatial windowing, adds the 4-pixel halo, and streams back the Cloud Op
 # Start the server with Uvicorn (port 8000, auto-reload)
 .\.venv\Scripts\python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
-
-- **Swagger Documentation:** Available at `http://localhost:8000/docs`
-- **Client Integration Guide:** See [`CLIENT_GUIDE.md`](./CLIENT_GUIDE.md) for Python, JavaScript, Browser/React, and cURL snippets.
-
-

@@ -1,4 +1,4 @@
-# Copernicus DEM 30m Client Connection Guide
+# Copernicus & Global DEM Client Connection Guide
 
 This guide explains how client-side applications can connect to the **sez_server** FastAPI service, request targeted DEM crops for any 4-node geographic polygon, receive the Cloud Optimized GeoTIFF (COG), and work with the embedded **4-pixel halo** for projection and upscaling/warping.
 
@@ -11,15 +11,15 @@ This guide explains how client-side applications can connect to the **sez_server
 
 | Method | Endpoint | Description | Content-Type |
 |---|---|---|---|
-| `GET` | `/health` | Server health, version, and status | `application/json` |
-| `POST` | `/api/v1/dem/inspect` | Returns envelope metadata, tiles queried, dimensions, and min/max elevation | `application/json` |
+| `GET` | `/health` | Server health, active provider, and status | `application/json` |
+| `POST` | `/api/v1/dem/inspect` | Returns envelope metadata, dataset queried, dimensions, and min/max elevation | `application/json` |
 | `POST` | `/api/v1/dem/crop` | Extracts and returns the DEM elevation GeoTIFF with 4-pixel halo | `image/tiff` |
 
 ---
 
-## 2. Request Geometry (4 Polygon Nodes)
+## 2. Request Geometry & Parameters
 
-The client sends a JSON payload with an array of exactly 4 geographic coordinates in WGS84 (`EPSG:4326`):
+The client sends a JSON payload with an array of exactly 4 geographic coordinates in WGS84 (`EPSG:4326`) and optional provider/dataset settings:
 
 ```json
 {
@@ -28,11 +28,18 @@ The client sends a JSON payload with an array of exactly 4 geographic coordinate
     {"lat": 45.833, "lon": 6.860},
     {"lat": 45.833, "lon": 6.864},
     {"lat": 45.830, "lon": 6.864}
-  ]
+  ],
+  "dem_type": "COP30",
+  "provider": "opentopography"
 }
 ```
 
-> **Note:** The server takes the minimum bounding box containing the 4 vertices, aligns it to the DEM pixel grid, and expands it outward by 4 DEM pixels ($\approx 123\,\text{m}$) in all 4 directions.
+### Supported `dem_type` values (OpenTopography):
+- `COP30` — Copernicus Global DSM 30m (Default)
+- `COP90` — Copernicus Global DSM 90m
+- `SRTMGL1` — NASA Shuttle Radar Topography Mission 30m
+- `AW3D30` — ALOS World 3D 30m
+- `NASADEM` — NASADEM Global DEM 30m
 
 ---
 
@@ -70,7 +77,9 @@ payload = {
         {"lat": 45.833, "lon": 6.860},
         {"lat": 45.833, "lon": 6.864},
         {"lat": 45.830, "lon": 6.864}
-    ]
+    ],
+    "dem_type": "COP30",
+    "provider": "opentopography"
 }
 
 # 1. (Optional) Inspect metadata first
@@ -83,18 +92,18 @@ response = requests.post(f"{SERVER_URL}/api/v1/dem/crop", json=payload)
 
 if response.status_code == 200:
     # Read headers
+    print("Provider:", response.headers.get("X-DEM-Provider"))
     print("Dimensions:", response.headers.get("X-DEM-Width"), "x", response.headers.get("X-DEM-Height"))
     print("Elevation range:", response.headers.get("X-DEM-Min-Elevation"), "to", response.headers.get("X-DEM-Max-Elevation"), "m")
 
-    # Option 1: Save directly to a GeoTIFF file
+    # Save to a GeoTIFF file
     with open("terrain_with_halo.tif", "wb") as f:
         f.write(response.content)
     print("Saved to terrain_with_halo.tif")
 
-    # Option 2: Open directly in memory with rasterio
+    # Or open directly in memory with rasterio
     with rasterio.open(io.BytesIO(response.content)) as src:
         elevation = src.read(1)  # Float32 NumPy array
-        profile = src.profile
         print("Loaded elevation array shape:", elevation.shape)
         print("Min elevation:", elevation.min(), "Max elevation:", elevation.max())
 else:
@@ -105,7 +114,7 @@ else:
 
 ### B. JavaScript / TypeScript (Node.js or Browser `fetch`)
 
-#### Node.js (`fetch` & save file):
+#### Node.js:
 ```javascript
 import fs from 'fs';
 
@@ -117,7 +126,8 @@ const payload = {
     { lat: 45.833, lon: 6.860 },
     { lat: 45.833, lon: 6.864 },
     { lat: 45.830, lon: 6.864 }
-  ]
+  ],
+  dem_type: 'COP30'
 };
 
 async function fetchDEM() {
@@ -139,29 +149,6 @@ async function fetchDEM() {
 fetchDEM();
 ```
 
-#### Browser / React (Fetch as Blob / URL):
-```javascript
-async function getDEMBlob() {
-  const response = await fetch('http://localhost:8000/api/v1/dem/crop', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      nodes: [
-        { lat: 45.830, lon: 6.860 },
-        { lat: 45.833, lon: 6.860 },
-        { lat: 45.833, lon: 6.864 },
-        { lat: 45.830, lon: 6.864 }
-      ]
-    })
-  });
-
-  const blob = await response.blob();
-  // Can be parsed with geotiff.js in browser:
-  // const tiff = await GeoTIFF.fromBlob(blob);
-  return blob;
-}
-```
-
 ---
 
 ### C. cURL (Command Line)
@@ -179,18 +166,4 @@ curl -X POST "http://localhost:8000/api/v1/dem/crop" \
      -H "Content-Type: application/json" \
      -d "{\"nodes\": [{\"lat\": 45.83, \"lon\": 6.86}, {\"lat\": 45.833, \"lon\": 6.86}, {\"lat\": 45.833, \"lon\": 6.864}, {\"lat\": 45.83, \"lon\": 6.864}]}" \
      --output dem_crop.tif
-```
-
----
-
-## 5. Starting the Server
-
-In the project folder `C:\Users\sajjad\Desktop\sez_server`:
-
-```powershell
-# Activate the virtual environment
-.\.venv\Scripts\Activate.ps1
-
-# Run server with Uvicorn (port 8000, auto-reload)
-python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```

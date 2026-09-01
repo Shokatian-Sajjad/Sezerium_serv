@@ -1,8 +1,8 @@
 """
-Data models for the sez_server DEM API.
+Data models for the sez_server DEM API and JWT authentication.
 """
 
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -31,6 +31,14 @@ class DEMPolygonRequest(BaseModel):
     nodes: List[Coordinate] = Field(
         ...,
         description="List of exactly 4 geographic nodes defining the requested area."
+    )
+    dem_type: Optional[str] = Field(
+        default=None,
+        description="DEM dataset identifier (e.g., 'COP30', 'COP90', 'SRTMGL1', 'AW3D30', 'NASADEM'). Defaults to configured DEFAULT_DEM_TYPE."
+    )
+    provider: Optional[str] = Field(
+        default=None,
+        description="DEM provider override ('opentopography' or 'aws_s3'). Defaults to configured DEM_PROVIDER."
     )
 
     @field_validator("nodes")
@@ -65,3 +73,28 @@ class DEMMetadataResponse(BaseModel):
     tiles_queried: List[str]
     crs: str = "EPSG:4326"
     resolution_deg: float
+    provider: str = "opentopography"
+    dem_type: str = "COP30"
+
+
+class TokenRequest(BaseModel):
+    """
+    Client authentication request to obtain a JWT Bearer token.
+    """
+    client_api_key: str = Field(
+        ...,
+        description="Pre-shared client API key configured on the server."
+    )
+    client_id: Optional[str] = Field(
+        default="sez_client",
+        description="Optional client identifier for token claims logging."
+    )
+
+
+class TokenResponse(BaseModel):
+    """
+    JWT Bearer token response.
+    """
+    access_token: str = Field(..., description="Signed JWT access token.")
+    token_type: str = Field(default="bearer", description="Token type (Bearer).")
+    expires_in_seconds: int = Field(..., description="Token validity lifetime in seconds.")
